@@ -20,6 +20,8 @@ all() ->
      t_bench_perf,
      t_write_stream,
      t_async_write_batch,
+     t_async_batch_timer_lifecycle,
+     t_async_write_after_health_check,
      t_write_greptime_cloud,
      t_auth_error,
      t_insert_requests,
@@ -260,7 +262,7 @@ t_write_failure(_) ->
         %% the port 5001 is invalid
         [{endpoints, [{http, greptime_host(), 5001}]},
          {pool, greptimedb_client_pool},
-         {pool_size, 5},
+         {pool_size, 1},
          {pool_type, random},
          {auth, {basic, #{username => ?GREPTIME_USERNAME, password => ?GREPTIME_PASSWORD}}}],
 
@@ -268,18 +270,31 @@ t_write_failure(_) ->
     false = greptimedb:is_alive(Client),
     {error, _} = greptimedb:write(Client, Metric, Points),
 
-    %% async write
+    %% The batch timer must be restarted for requests left after the first failure.
     Ref = make_ref(),
     TestPid = self(),
     ResultCallback = {fun(Reply) -> TestPid ! {{Ref, reply}, Reply} end, []},
 
-    ok = greptimedb:async_write(Client, Metric, Points, ResultCallback),
-    receive
-        {{Ref, reply}, {error, Error}} ->
-            ct:print("write failure: ~p", [Error]);
-        {{Ref, reply}, _Other} ->
-            ?assert(false)
-    end,
+    [{_, PoolWorker}] = ecpool:workers(greptimedb_client_pool),
+    {ok, Worker} = ecpool_worker:client(PoolWorker),
+    with_suspended_worker(
+      Worker,
+      fun() ->
+          ok = greptimedb:async_write(Client, Metric, Points, ResultCallback),
+          ok = greptimedb:async_write(Client, Metric, Points, ResultCallback)
+      end),
+    lists:foreach(
+      fun(_) ->
+          receive
+              {{Ref, reply}, {error, Error}} ->
+                  ct:print("write failure: ~p", [Error]);
+              {{Ref, reply}, Other} ->
+                  ct:fail({unexpected_async_write_result, Other})
+          after 5000 ->
+              ct:fail(async_write_failure_not_retried)
+          end
+      end,
+      lists:seq(1, 2)),
 
     greptimedb:stop_client(Client),
     ok.
@@ -698,6 +713,139 @@ t_async_write_batch(_) ->
 
     greptimedb:stop_client(Client),
     ok.
+
+t_async_batch_timer_lifecycle(_) ->
+    Pool = iolist_to_binary([
+        "greptimedb_batch_timer_", integer_to_binary(erlang:unique_integer([positive]))
+    ]),
+    Options =
+        [{endpoints, [{http, greptime_host(), 4001}]},
+         {pool, Pool},
+         {pool_size, 1},
+         {pool_type, random},
+         {auth, {basic, #{username => ?GREPTIME_USERNAME, password => ?GREPTIME_PASSWORD}}}],
+    {ok, Client} = greptimedb:start_client(Options),
+    try
+        [{_, PoolWorker}] = ecpool:workers(Pool),
+        {ok, Worker} = ecpool_worker:client(PoolWorker),
+        Request =
+            greptimedb_encoder:insert_requests(
+              Client,
+              [{<<"async_batch_timer">>,
+                [#{fields => #{<<"value">> => 1.0},
+                   tags => #{<<"source">> => <<"batch_timer">>},
+                   timestamp => erlang:system_time(millisecond)}]}]),
+        Ref = make_ref(),
+        TestPid = self(),
+        ResultCallback = {fun(Reply) -> TestPid ! {Ref, Reply} end, []},
+
+        with_suspended_worker(
+          Worker,
+          fun() ->
+              lists:foreach(
+                fun(_) ->
+                    ok = greptimedb_worker:async_handle(Worker, Request, ResultCallback)
+                end,
+                lists:seq(1, 200))
+          end),
+        recv_async_results(Ref, 200),
+        with_suspended_worker(
+          Worker,
+          fun() ->
+              {state, _Channel, #{pending_count := 0}, _Hints, undefined} =
+                  sys:get_state(Worker)
+          end),
+
+        StaleTRef = make_ref(),
+        ok = greptimedb_worker:async_handle(Worker, Request, ResultCallback),
+        Worker ! {timeout, StaleTRef, flush_batch},
+        with_suspended_worker(
+          Worker,
+          fun() ->
+              {state, _Channel, #{pending_count := 1}, _Hints, NewTRef} =
+                  sys:get_state(Worker),
+              true = is_reference(NewTRef),
+              false = NewTRef =:= StaleTRef
+          end),
+        recv_async_results(Ref, 1)
+    after
+        greptimedb:stop_client(Client)
+    end.
+
+recv_async_results(_Ref, 0) ->
+    ok;
+recv_async_results(Ref, N) ->
+    receive
+        {Ref, {ok, _}} ->
+            recv_async_results(Ref, N - 1);
+        {Ref, Error} ->
+            ct:fail({async_write_failed, Error})
+    after 5000 ->
+        ct:fail({async_write_results_missing, N})
+    end.
+
+with_suspended_worker(Worker, Fun) ->
+    ok = sys:suspend(Worker),
+    try
+        Fun()
+    after
+        ok = sys:resume(Worker)
+    end.
+
+t_async_write_after_health_check(_) ->
+    Pool = iolist_to_binary([
+        "greptimedb_health_check_", integer_to_binary(erlang:unique_integer([positive]))
+    ]),
+    Options =
+        [{endpoints, [{http, greptime_host(), 4001}]},
+         {pool, Pool},
+         {pool_size, 1},
+         {pool_type, random},
+         {auth, {basic, #{username => ?GREPTIME_USERNAME, password => ?GREPTIME_PASSWORD}}}],
+    {ok, Client} = greptimedb:start_client(Options),
+    try
+        Ref = make_ref(),
+        TestPid = self(),
+        [{_, PoolWorker}] = ecpool:workers(Pool),
+        {ok, Worker} = ecpool_worker:client(PoolWorker),
+        ResultCallback = {fun(Reply) -> TestPid ! {Ref, Reply} end, []},
+        Points =
+            [#{fields => #{<<"value">> => 1.0},
+               tags => #{<<"source">> => <<"health_check">>},
+               timestamp => erlang:system_time(millisecond)}],
+        ok = greptimedb:async_write(Client, <<"async_health_check">>, Points, ResultCallback),
+        true = greptimedb:is_alive(Client),
+        Deadline = erlang:monotonic_time(millisecond) + 2000,
+        Flood =
+            fun F() ->
+                case erlang:monotonic_time(millisecond) < Deadline of
+                    true ->
+                        _ = sys:get_state(Worker),
+                        F();
+                    false ->
+                        TestPid ! {Ref, flood_done}
+                end
+            end,
+        spawn(Flood),
+        receive
+            {Ref, {ok, _}} ->
+                ok;
+            {Ref, flood_done} ->
+                ct:fail(async_write_delayed_by_worker_messages);
+            {Ref, Error} ->
+                ct:fail({async_write_failed, Error})
+        after 5000 ->
+            ct:fail(async_write_not_flushed)
+        end,
+        receive
+            {Ref, flood_done} ->
+                ok
+        after 3000 ->
+            ct:fail(worker_message_flood_not_finished)
+        end
+    after
+        greptimedb:stop_client(Client)
+    end.
 
 t_write_greptime_cloud(_) ->
     Host = os:getenv("GT_TEST_HOST"),
