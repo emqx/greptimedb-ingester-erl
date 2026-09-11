@@ -23,6 +23,7 @@ all() ->
      t_async_write_batch,
      t_async_batch_timer_lifecycle,
      t_async_write_after_health_check,
+     t_health_check_with_busy_worker,
      t_write_greptime_cloud,
      t_auth_error,
      t_insert_requests,
@@ -868,6 +869,28 @@ t_async_write_after_health_check(_) ->
             ct:fail(worker_message_flood_not_finished)
         end
     after
+        greptimedb:stop_client(Client)
+    end.
+
+%% A worker blocked on a batch write must not fail the health check.
+t_health_check_with_busy_worker(_) ->
+    Pool = iolist_to_binary([
+        "greptimedb_busy_worker_", integer_to_binary(erlang:unique_integer([positive]))
+    ]),
+    Options =
+        [{endpoints, [{http, greptime_host(), 4001}]},
+         {pool, Pool},
+         {pool_size, 1},
+         {pool_type, random},
+         {auth, {basic, #{username => ?GREPTIME_USERNAME, password => ?GREPTIME_PASSWORD}}}],
+    {ok, Client} = greptimedb:start_client(Options),
+    [{_, PoolWorker}] = ecpool:workers(Pool),
+    {ok, Worker} = ecpool_worker:client(PoolWorker),
+    ok = sys:suspend(Worker),
+    try
+        ?assert(greptimedb:is_alive(Client))
+    after
+        ok = sys:resume(Worker),
         greptimedb:stop_client(Client)
     end.
 
