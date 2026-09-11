@@ -19,6 +19,8 @@
 
 -export_type([metric/0, point/0, timeunit/0]).
 
+-define(HEALTH_CHECK_TIMEOUT, 5_000).
+
 -type table() :: atom() | binary() | list().
 -type dbname() :: atom() | binary() | list().
 -type timeunit() :: ns | us| ms | s | nanosecond | microsecond | millisecond | second.
@@ -153,15 +155,45 @@ async_handle(#{pool := Pool} = _Client, Request, ResultCallback) ->
             {error, {E, R}}
     end.
 
+%% Send the health check RPC from the calling process on one worker's gRPC channel.
+%% Do not call the worker: it blocks for up to 10 seconds on each batch write, and
+%% a call through its mailbox times out even when the connection is healthy.
 health_check(#{pool := Pool} = _Client) ->
-    Fun = fun(Worker) -> greptimedb_worker:health_check(Worker) end,
     try
-        ecpool:with_client(Pool, Fun)
+        case pick_channel(Pool) of
+            {ok, Channel} ->
+                Ctx = ctx:with_deadline_after(?HEALTH_CHECK_TIMEOUT, millisecond),
+                case greptime_v_1_health_check_client:health_check(Ctx, #{}, #{channel => Channel}) of
+                    {ok, Resp, _} ->
+                        {ok, Resp};
+                    Err ->
+                        Err
+                end;
+            {error, _} = Error ->
+                Error
+        end
     catch
         E:R:S ->
             logger:error("[GreptimeDB] grpc health check failed: ~0p ~0p ~0p", [E, R, S]),
             {error, {E, R}}
     end.
+
+pick_channel(Pool) ->
+    case ecpool:workers(Pool) of
+        [] ->
+            {error, no_available_worker};
+        Workers ->
+            {{_Pool, WorkerId}, _Pid} = lists:nth(rand:uniform(length(Workers)), Workers),
+            {ok, channel_name(Pool, WorkerId)}
+    end.
+
+%% Must match the channel name built in greptimedb_worker:init/1.
+channel_name(Pool, WorkerId) ->
+    PoolName = case is_binary(Pool) of
+                   true -> Pool;
+                   false -> iolist_to_binary(io_lib:format("~0tp", [Pool]))
+               end,
+    iolist_to_binary([PoolName, ":", integer_to_binary(WorkerId)]).
 
 rpc_write_stream(#{pool := Pool, cli_opts := Options} = _Client) ->
     Fun = fun(Worker) ->
