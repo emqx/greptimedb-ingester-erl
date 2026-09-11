@@ -184,16 +184,8 @@ pick_channel(Pool) ->
             {error, no_available_worker};
         Workers ->
             {{_Pool, WorkerId}, _Pid} = lists:nth(rand:uniform(length(Workers)), Workers),
-            {ok, channel_name(Pool, WorkerId)}
+            {ok, greptimedb_worker:channel_name(Pool, WorkerId)}
     end.
-
-%% Must match the channel name built in greptimedb_worker:init/1.
-channel_name(Pool, WorkerId) ->
-    PoolName = case is_binary(Pool) of
-                   true -> Pool;
-                   false -> iolist_to_binary(io_lib:format("~0tp", [Pool]))
-               end,
-    iolist_to_binary([PoolName, ":", integer_to_binary(WorkerId)]).
 
 rpc_write_stream(#{pool := Pool, cli_opts := Options} = _Client) ->
     Fun = fun(Worker) ->

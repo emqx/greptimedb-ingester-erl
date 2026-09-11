@@ -23,6 +23,7 @@
 -export([handle/2, stream/1, ddl/0, health_check/1]).
 -export([start_link/1, init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, async_handle/3]).
 -export([connect/1]).
+-export([channel_name/2]).
 
 -record(state, {channel, requests, hints, batch_timer = undefined}).
 
@@ -50,11 +51,7 @@
 %% ===================================================================
 init(Args) ->
     process_flag(trap_exit, true),
-    {pool, PoolName0} = lists:keyfind(pool, 1, Args),
-    PoolName = case is_binary(PoolName0) of
-                   true -> PoolName0;
-                   false -> iolist_to_binary(io_lib:format("~0tp", [PoolName0]))
-               end,
+    {pool, PoolName} = lists:keyfind(pool, 1, Args),
     {ecpool_worker_id, WorkerId} = lists:keyfind(ecpool_worker_id, 1, Args),
     Endpoints = proplists:get_value(endpoints, Args),
     Hints0 = proplists:get_value(grpc_hints, Args, #{}),
@@ -70,7 +67,7 @@ init(Args) ->
     Channels =
         lists:map(fun({Scheme, Host, Port}) -> {Scheme, Host, Port, ssl_options(Scheme, SslOptions)}
                   end, Endpoints),
-    Channel = iolist_to_binary([PoolName, ":", integer_to_binary(WorkerId)]),
+    Channel = channel_name(PoolName, WorkerId),
     {ok, _} = start_channel(Channel, Channels, Options),
     logger:debug("[GreptimeDB] genserver has started (~s)~n", [Channel]),
     {ok, #state{channel = Channel, hints = Hints, requests = #{ pending => queue:new(), pending_count => 0}}}.
@@ -353,6 +350,15 @@ async_handle(Pid, Request, ResultCallback) ->
 
 health_check(Pid) ->
     gen_server:call(Pid, health_check, ?HEALTH_CHECK_TIMEOUT).
+
+%% @doc Name of the gRPC channel owned by the pool worker with this ecpool worker ID.
+-spec channel_name(PoolName :: term(), WorkerId :: pos_integer()) -> binary().
+channel_name(PoolName0, WorkerId) ->
+    PoolName = case is_binary(PoolName0) of
+                   true -> PoolName0;
+                   false -> iolist_to_binary(io_lib:format("~0tp", [PoolName0]))
+               end,
+    iolist_to_binary([PoolName, ":", integer_to_binary(WorkerId)]).
 
 stream(Pid) ->
     try
